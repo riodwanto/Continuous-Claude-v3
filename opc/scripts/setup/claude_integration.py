@@ -689,3 +689,143 @@ def get_platform_info() -> dict[str, str]:
         "release": platform.release(),
         "machine": platform.machine(),
     }
+
+
+def find_latest_backup(claude_dir: Path) -> Path | None:
+    """Find the most recent .claude.backup.* directory.
+
+    Args:
+        claude_dir: Path to current .claude directory
+
+    Returns:
+        Path to most recent backup, or None if no backups found
+    """
+    parent = claude_dir.parent
+    backups = sorted(parent.glob(".claude.backup.*"), reverse=True)
+    return backups[0] if backups else None
+
+
+# Files to preserve during uninstall (user data accumulated since install)
+PRESERVE_FILES = [
+    "history.jsonl",      # Command history
+    "mcp_config.json",    # MCP server configs
+    ".env",               # API keys and settings
+    "projects.json",      # Project configs
+]
+
+PRESERVE_DIRS = [
+    "file-history",       # File edit history
+    "projects",           # Project-specific data
+]
+
+
+def uninstall_opc_integration(
+    project_dir: Path | None = None,
+    is_global: bool = False,
+) -> dict[str, Any]:
+    """Uninstall OPC integration and restore from backup.
+
+    This function:
+    1. Archives current .claude to .claude-v3.archived.<timestamp>
+    2. Restores from the most recent .claude.backup.* if available
+    3. Preserves user data (history, MCP configs, etc.) by copying to restored dir
+
+    Args:
+        project_dir: Project directory (uses cwd if None)
+        is_global: If True, operate on global ~/.claude
+
+    Returns:
+        dict with keys:
+            - success: bool
+            - archived_to: Path where current .claude was moved
+            - restored_from: Path that was restored (or None)
+            - preserved: List of preserved files/dirs
+            - message: Human-readable summary
+    """
+    if is_global:
+        claude_dir = get_global_claude_dir()
+    else:
+        claude_dir = get_claude_dir(project_dir)
+
+    result: dict[str, Any] = {
+        "success": False,
+        "archived_to": None,
+        "restored_from": None,
+        "preserved": [],
+        "message": "",
+    }
+
+    if not claude_dir.exists():
+        result["message"] = "No .claude directory found - nothing to uninstall"
+        result["success"] = True
+        return result
+
+    # Step 1: Collect files to preserve BEFORE archiving
+    preserved_data: dict[str, Path] = {}
+    for filename in PRESERVE_FILES:
+        src = claude_dir / filename
+        if src.exists():
+            preserved_data[filename] = src
+    for dirname in PRESERVE_DIRS:
+        src = claude_dir / dirname
+        if src.exists() and src.is_dir():
+            preserved_data[dirname] = src
+
+    # Step 2: Archive current .claude
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_path = claude_dir.parent / f".claude-v3.archived.{timestamp}"
+
+    try:
+        shutil.move(str(claude_dir), str(archive_path))
+        result["archived_to"] = archive_path
+    except Exception as e:
+        result["message"] = f"Failed to archive current .claude: {e}"
+        return result
+
+    # Step 3: Find and restore from backup
+    backup = find_latest_backup(archive_path.parent / ".claude")
+    if backup is None:
+        backup = find_latest_backup(archive_path)
+
+    if backup and backup.exists():
+        try:
+            shutil.copytree(backup, claude_dir)
+            result["restored_from"] = backup
+        except Exception as e:
+            result["message"] = (
+                f"Archived v3 to {archive_path.name}, but restore failed: {e}\n"
+                f"  Manual restore: cp -r {backup} {claude_dir}"
+            )
+            result["success"] = True
+            return result
+    else:
+        # No backup - create empty .claude
+        claude_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 4: Preserve user data by copying from archive to restored dir
+    for name, src_path in preserved_data.items():
+        archived_src = archive_path / name
+        dest = claude_dir / name
+        if archived_src.exists() and not dest.exists():
+            try:
+                if archived_src.is_dir():
+                    shutil.copytree(archived_src, dest)
+                else:
+                    shutil.copy2(archived_src, dest)
+                result["preserved"].append(name)
+            except Exception:
+                pass  # Best effort
+
+    # Build summary message
+    msg_parts = ["Uninstalled successfully."]
+    msg_parts.append(f"  Archived v3 to: {archive_path.name}")
+    if result["restored_from"]:
+        msg_parts.append(f"  Restored from: {backup.name}")
+    else:
+        msg_parts.append("  No backup found (created empty .claude)")
+    if result["preserved"]:
+        msg_parts.append(f"  Preserved user data: {', '.join(result['preserved'])}")
+
+    result["message"] = "\n".join(msg_parts)
+    result["success"] = True
+    return result
